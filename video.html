@@ -9,8 +9,8 @@ h1 { color: #e94560; font-size: 18px; }
 .label { color: #e94560; font-weight: bold; }
 .ok { color: #0f0; }
 .err { color: #f00; }
-#preview { max-width: 480px; border: 2px solid #e94560; background: #000; display: block; }
-#log { white-space: pre-wrap; font-size: 11px; max-height: 200px; overflow-y: auto; }
+#preview { max-width: 640px; border: 2px solid #e94560; background: #000; display: block; image-rendering: auto; }
+#log { white-space: pre-wrap; font-size: 11px; max-height: 150px; overflow-y: auto; }
 .thumb-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .thumb-grid img { width: 160px; border: 1px solid #333; }
 a.dl { color: #0f0; font-weight: bold; display: inline-block; margin-top: 8px; padding: 6px 14px; border: 1px solid #0f0; text-decoration: none; }
@@ -18,7 +18,7 @@ a.dl:hover { background: #0f03; }
 </style>
 </head>
 <body>
-<h1>Miro Desktop PoC — Continuous Screen Capture v4</h1>
+<h1>Miro Desktop PoC — Continuous Screen Capture v5</h1>
 
 <div class="section">
 <span class="label">Bridge</span>
@@ -26,9 +26,9 @@ a.dl:hover { background: #0f03; }
 </div>
 
 <div class="section">
-<span class="label">Live Capture — <span id="frame-count">0</span> frames</span>
+<span class="label">Live Capture — <span id="frame-count">0</span> frames, <span id="fps-display">0</span> fps</span>
 <div id="rec-status"></div>
-<canvas id="preview" width="800" height="600"></canvas>
+<canvas id="preview" width="1280" height="720"></canvas>
 <div id="download"></div>
 </div>
 
@@ -43,9 +43,8 @@ a.dl:hover { background: #0f03; }
 </div>
 
 <script>
-var CAPTURE_INTERVAL_MS = 500;
 var CAPTURE_DURATION_S = 30;
-var KEYFRAME_EVERY = 10;
+var KEYFRAME_EVERY = 15;
 
 function log(msg) {
     var el = document.getElementById('log');
@@ -73,19 +72,32 @@ function show(id, cls, html) {
         show('bridge', 'ok', 'Config: ' + esc(JSON.stringify(config)));
     } catch(e) {}
     try {
-        var info = _rtb_app_actions_.getDeviceInfo();
-        show('bridge', 'ok', 'Device: ' + esc(JSON.stringify(info)));
+        var dinfo = _rtb_app_actions_.getDeviceInfo();
+        show('bridge', 'ok', 'Device: ' + esc(JSON.stringify(dinfo)));
     } catch(e) {}
 
-    // Setup canvas + MediaRecorder to save as video
     var canvas = document.getElementById('preview');
     var ctx = canvas.getContext('2d');
     var frameCount = 0;
     var startTime = Date.now();
     var endTime = startTime + (CAPTURE_DURATION_S * 1000);
+    var done = false;
 
-    // Record the canvas as a webm video
-    var canvasStream = canvas.captureStream(0); // 0 = manual frame push
+    // FPS tracking
+    var fpsFrames = 0;
+    var fpsLast = Date.now();
+    setInterval(function() {
+        var now = Date.now();
+        var elapsed = (now - fpsLast) / 1000;
+        if (elapsed > 0) {
+            document.getElementById('fps-display').textContent = (fpsFrames / elapsed).toFixed(1);
+        }
+        fpsFrames = 0;
+        fpsLast = now;
+    }, 1000);
+
+    // Canvas stream -> MediaRecorder for downloadable video
+    var canvasStream = canvas.captureStream(0);
     var recorder = null;
     var videoChunks = [];
     var mimeType = 'video/webm';
@@ -96,7 +108,7 @@ function show(id, cls, html) {
         } else if (MediaRecorder.isTypeSupported('video/webm;codecs=vp8')) {
             mimeType = 'video/webm;codecs=vp8';
         }
-        recorder = new MediaRecorder(canvasStream, { mimeType: mimeType, videoBitsPerSecond: 2000000 });
+        recorder = new MediaRecorder(canvasStream, { mimeType: mimeType, videoBitsPerSecond: 2500000 });
         recorder.ondataavailable = function(e) {
             if (e.data && e.data.size > 0) videoChunks.push(e.data);
         };
@@ -105,74 +117,88 @@ function show(id, cls, html) {
             var url = URL.createObjectURL(blob);
             var a = document.createElement('a');
             a.href = url;
-            a.download = 'miro_screen_capture_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
+            a.download = 'miro_capture_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
             a.className = 'dl';
-            a.textContent = 'DOWNLOAD VIDEO (' + (blob.size / 1024 / 1024).toFixed(1) + ' MB, ' + frameCount + ' frames)';
+            a.textContent = 'DOWNLOAD VIDEO (' + (blob.size / 1024 / 1024).toFixed(1) + ' MB, ' + frameCount + ' frames, ' + CAPTURE_DURATION_S + 's)';
             document.getElementById('download').appendChild(a);
-            log('Video ready: ' + blob.size + ' bytes');
-            show('rec-status', 'ok', '<b>VIDEO SAVED — click download link above</b>');
+            log('Video ready: ' + (blob.size / 1024 / 1024).toFixed(2) + ' MB');
+            show('rec-status', 'ok', '<b>VIDEO READY — click download link</b>');
         };
-        recorder.start(1000); // chunk every 1s
-        log('MediaRecorder started: ' + mimeType);
+        recorder.start(500);
+        log('MediaRecorder: ' + mimeType);
     }
 
-    show('rec-status', 'ok', 'RECORDING — ' + CAPTURE_DURATION_S + 's @ ~' + (1000/CAPTURE_INTERVAL_MS) + ' fps');
+    show('rec-status', 'ok', 'RECORDING — ' + CAPTURE_DURATION_S + 's');
     log('Capture started');
 
-    async function captureFrame() {
-        if (Date.now() >= endTime) {
-            // Stop recording
-            if (recorder && recorder.state === 'recording') {
-                recorder.stop();
+    // Preloaded image for smooth rendering — avoids flicker from
+    // creating a new Image() each frame. We double-buffer: fetch
+    // the next frame while the current one is still on screen.
+    var imgA = new Image();
+    var imgB = new Image();
+    var useA = true;
+
+    // Continuous capture — fires as fast as IPC can deliver.
+    // No fixed interval: as soon as one frame arrives, request the next.
+    async function captureLoop() {
+        while (!done) {
+            if (Date.now() >= endTime) {
+                done = true;
+                if (recorder && recorder.state === 'recording') recorder.stop();
+                show('rec-status', 'ok', '<b>DONE — ' + frameCount + ' frames in ' + CAPTURE_DURATION_S + 's</b>');
+                log('Complete: ' + frameCount + ' frames');
+                return;
             }
-            show('rec-status', 'ok', '<b>DONE — ' + frameCount + ' frames captured</b>');
-            log('Complete: ' + frameCount + ' frames in ' + CAPTURE_DURATION_S + 's');
-            return;
-        }
 
-        try {
-            var sources = await _rtb_app_actions_.getScreenSharingSources({
-                includeScreens: true,
-                includeAppWindows: false,
-                thumbnailWidth: 800,
-                thumbnailHeight: 600
-            });
+            try {
+                var sources = await _rtb_app_actions_.getScreenSharingSources({
+                    includeScreens: true,
+                    includeAppWindows: false,
+                    thumbnailWidth: 1280,
+                    thumbnailHeight: 720
+                });
 
-            if (sources.length > 0 && sources[0].thumbnailUrl) {
-                frameCount++;
-                document.getElementById('frame-count').textContent = frameCount;
+                if (sources.length > 0 && sources[0].thumbnailUrl) {
+                    // Double-buffer: load into whichever image isn't on screen
+                    var currentImg = useA ? imgA : imgB;
+                    useA = !useA;
 
-                // Draw to canvas
-                var img = new Image();
-                img.onload = function() {
-                    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-                    // Push frame to MediaRecorder
-                    if (canvasStream.getVideoTracks().length > 0) {
-                        try { canvasStream.getVideoTracks()[0].requestFrame(); } catch(e) {}
+                    await new Promise(function(resolve) {
+                        currentImg.onload = function() {
+                            ctx.drawImage(currentImg, 0, 0, canvas.width, canvas.height);
+                            // Push frame to recorder
+                            try {
+                                var tracks = canvasStream.getVideoTracks();
+                                if (tracks.length > 0) tracks[0].requestFrame();
+                            } catch(e) {}
+                            resolve();
+                        };
+                        currentImg.onerror = resolve;
+                        currentImg.src = sources[0].thumbnailUrl;
+                    });
+
+                    frameCount++;
+                    fpsFrames++;
+                    document.getElementById('frame-count').textContent = frameCount;
+
+                    // Keyframes
+                    if (frameCount === 1 || frameCount % KEYFRAME_EVERY === 0) {
+                        var thumb = document.createElement('img');
+                        thumb.src = sources[0].thumbnailUrl;
+                        thumb.title = 'Frame ' + frameCount;
+                        document.getElementById('keyframes').appendChild(thumb);
                     }
-                };
-                img.src = sources[0].thumbnailUrl;
 
-                // Keyframe thumbnails
-                if (frameCount === 1 || frameCount % KEYFRAME_EVERY === 0) {
-                    var thumb = document.createElement('img');
-                    thumb.src = sources[0].thumbnailUrl;
-                    thumb.title = 'Frame ' + frameCount;
-                    document.getElementById('keyframes').appendChild(thumb);
+                    if (frameCount % 20 === 0) log('Frame ' + frameCount);
                 }
-
-                if (frameCount % 10 === 0) {
-                    log('Frame ' + frameCount);
-                }
+            } catch(e) {
+                log('Error: ' + e.message);
+                await new Promise(function(r) { setTimeout(r, 200); });
             }
-        } catch(e) {
-            log('Error: ' + e.message);
         }
-
-        setTimeout(captureFrame, CAPTURE_INTERVAL_MS);
     }
 
-    captureFrame();
+    captureLoop();
 })();
 </script>
 </body>
